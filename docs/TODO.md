@@ -1,3 +1,5 @@
+- [ ] X - more reliable data retrieval
+- [ ] X - fuzzy search?
 - [x] X - faster data retrieval?
 - [x] X - need to implement faster and better infinite scroll logic. why are posts still not retrieved in order?
 - [x] X - get_bookmarks seems to be retrieving posts from oldest to newest. need this logic flipped

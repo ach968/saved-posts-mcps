@@ -142,14 +142,14 @@ class XScraper:
     async def get_bookmarks(
         self,
         limit: Optional[int] = None,
-        max_scrolls: int = 100,
+        max_scrolls: int = 250,
     ) -> list[SavedPost]:
         """
         Fetch bookmarked tweets by intercepting X's GraphQL API responses.
 
         Args:
             limit: Maximum number of bookmarks to return
-            max_scrolls: Safety limit for maximum scroll attempts (default 100)
+            max_scrolls: Safety limit for maximum scroll attempts (default 250)
 
         Returns:
             List of SavedPost objects
@@ -194,18 +194,20 @@ class XScraper:
                 return []
 
             # Wait for initial content
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
-            target = limit if limit else 25
             scroll_num = 0
             no_new_count = 0
             last_count = 0
 
-            while scroll_num < max_scrolls and len(collected_posts) < target:
+            while scroll_num < max_scrolls:
+                if limit and len(collected_posts) >= limit:
+                    logger.info(f"Reached limit of {limit} posts")
+                    break
                 scroll_num += 1
 
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
                 # Check if we got new posts
                 if len(collected_posts) > last_count:
@@ -214,7 +216,7 @@ class XScraper:
                     no_new_count = 0
                 else:
                     no_new_count += 1
-                    if no_new_count >= 3:
+                    if no_new_count >= 5:
                         logger.info(f"No new content after {scroll_num} scrolls, stopping")
                         break
 

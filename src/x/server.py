@@ -19,7 +19,7 @@ def get_scraper() -> XScraper:
 
 
 @mcp.tool()
-async def get_x_bookmarks(limit: int = 25) -> list[dict]:
+async def get_x_bookmarks(limit: int = 10) -> list[dict]:
     """
     Fetch the user's bookmarked tweets from X (Twitter) via web scraping.
 
@@ -39,7 +39,7 @@ async def get_x_bookmarks(limit: int = 25) -> list[dict]:
 
 
 @mcp.tool()
-async def search_x_bookmarks(query: str, limit: int = 25) -> list[dict]:
+async def search_x_bookmarks(query: str) -> list[dict]:
     """
     Search through bookmarked tweets by keyword.
 
@@ -56,7 +56,7 @@ async def search_x_bookmarks(query: str, limit: int = 25) -> list[dict]:
 
     bookmarks = await scraper.get_bookmarks()
 
-    results = scraper.search_bookmarks(bookmarks, query=query, limit=limit)
+    results = scraper.search_bookmarks(bookmarks, query=query)
 
     return [simplify_post(post) for post in results]
 
