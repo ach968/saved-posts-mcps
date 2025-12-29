@@ -8,8 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
 
 from src.common.models import Author, Media, SavedPost, XMetadata
 
@@ -25,7 +24,7 @@ BOOKMARKS_URL = "https://x.com/i/bookmarks"
 
 
 class XScraper:
-    """Scraper for X.com bookmarks using Playwright with browser cookies."""
+    """Scraper for X.com bookmarks using Playwright."""
 
     def __init__(
         self,
@@ -134,17 +133,22 @@ class XScraper:
             await self._browser.close()
             self._browser = None
 
-    async def fetch_bookmarks_page(self, scroll_count: int = 3) -> str:
+    async def get_bookmarks(
+        self,
+        limit: Optional[int] = None,
+        scroll_count: int = 15,
+    ) -> list[SavedPost]:
         """
-        Fetch the bookmarks page HTML using Playwright.
+        Fetch and parse bookmarked tweets using Playwright.
 
         Args:
-            scroll_count: Number of times to scroll down to load more tweets
+            limit: Maximum number of bookmarks to return
+            scroll_count: Number of times to scroll for more content
 
         Returns:
-            HTML content of the page
+            List of SavedPost objects
         """
-        logger.info(f"Starting fetch_bookmarks_page with {scroll_count} scrolls")
+        logger.info(f"Starting get_bookmarks with {scroll_count} scrolls")
         logger.info(f"Loaded {len(self.cookies)} cookies")
 
         context = await self._get_context()
@@ -154,7 +158,7 @@ class XScraper:
         logger.info("Created new page")
 
         try:
-            # Navigate to bookmarks - use domcontentloaded instead of networkidle
+            # Navigate to bookmarks
             logger.info(f"Navigating to {BOOKMARKS_URL}")
             await page.goto(BOOKMARKS_URL, wait_until="domcontentloaded", timeout=60000)
             logger.info(f"Page loaded, current URL: {page.url}")
@@ -166,8 +170,7 @@ class XScraper:
             # Check if we got redirected to login
             if "login" in page.url.lower():
                 logger.error("Redirected to login page - cookies may be invalid")
-                html = await page.content()
-                return html
+                return []
 
             # Wait for tweets to load
             logger.info("Waiting for article elements...")
@@ -176,12 +179,7 @@ class XScraper:
                 logger.info("Found article elements")
             except Exception as e:
                 logger.warning(f"No articles found: {e}")
-                # Save page content for debugging
-                html = await page.content()
-                with open("/tmp/x_bookmarks_debug.html", "w") as f:
-                    f.write(html)
-                logger.info("HTML saved to /tmp/x_bookmarks_debug.html")
-                return html
+                return []
 
             # Scroll to load more tweets
             for i in range(scroll_count):
@@ -189,14 +187,17 @@ class XScraper:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(1.5)
 
-            # Get the page content
-            html = await page.content()
-            logger.info(f"Got page content, length: {len(html)}")
-            return html
+            # Parse articles using Playwright locators
+            posts = await self._parse_articles(page)
+            logger.info(f"Parsed {len(posts)} posts")
+
+            if limit:
+                posts = posts[:limit]
+
+            return posts
 
         except Exception as e:
             logger.error(f"Error during fetch: {e}")
-            # Try to save screenshot on error
             try:
                 await page.screenshot(path="/tmp/x_bookmarks_error.png")
                 logger.info("Error screenshot saved to /tmp/x_bookmarks_error.png")
@@ -208,58 +209,56 @@ class XScraper:
             await page.close()
             logger.info("Page closed")
 
-    def parse_articles(self, html: str) -> list[SavedPost]:
-        """
-        Parse article elements from the bookmarks page.
+    async def _parse_articles(self, page: Page) -> list[SavedPost]:
+        """Parse all article elements from the page using Playwright."""
+        articles = page.locator("article")
+        count = await articles.count()
+        logger.info(f"Found {count} articles to parse")
 
-        Args:
-            html: Raw HTML content from the bookmarks page
-
-        Returns:
-            List of SavedPost objects
-        """
-        soup = BeautifulSoup(html, "lxml")
-        articles = soup.find_all("article")
         posts = []
-
-        for article in articles:
+        for i in range(count):
             try:
-                post = self._parse_article(article)
+                article = articles.nth(i)
+                post = await self._parse_article(article)
                 if post:
                     posts.append(post)
             except Exception as e:
-                # Log but continue parsing other articles
-                logger.warning(f"Error parsing article: {e}")
+                logger.warning(f"Error parsing article {i}: {e}")
                 continue
 
         return posts
 
-    def _parse_article(self, article) -> Optional[SavedPost]:
+    async def _parse_article(self, article: Locator) -> Optional[SavedPost]:
         """Parse a single article element into a SavedPost."""
         # Extract tweet text
-        tweet_text_div = article.find("div", {"data-testid": "tweetText"})
-        content = tweet_text_div.get_text(separator=" ", strip=True) if tweet_text_div else ""
+        tweet_text = article.locator('[data-testid="tweetText"]')
+        content = ""
+        if await tweet_text.count() > 0:
+            content = await tweet_text.first.inner_text()
 
         # Extract author info from User-Name div
-        user_name_element = article.find("div", {"data-testid": "User-Name"})
-        if not user_name_element:
+        user_name_element = article.locator('[data-testid="User-Name"]')
+        if await user_name_element.count() == 0:
             return None
 
-        # Find all links in the User-Name section
-        links = user_name_element.find_all("a")
+        # Find username from links
+        links = user_name_element.locator("a")
         username = None
         display_name = None
 
-        for link in links:
-            href = link.get("href", "")
+        link_count = await links.count()
+        for j in range(link_count):
+            link = links.nth(j)
+            href = await link.get_attribute("href") or ""
             if href and re.match(r"^/[^/]+$", href) and not href.startswith("/i/"):
                 username = href.strip("/")
-                # Display name is usually in a span within the first link
-                spans = link.find_all("span")
-                for span in spans:
-                    text = span.get_text(strip=True)
+                # Try to get display name from spans
+                spans = link.locator("span")
+                span_count = await spans.count()
+                for k in range(span_count):
+                    text = await spans.nth(k).inner_text()
                     if text and not text.startswith("@"):
-                        display_name = text
+                        display_name = text.strip()
                         break
                 break
 
@@ -269,12 +268,12 @@ class XScraper:
         if not display_name:
             display_name = username
 
-        # Extract tweet ID from the permalink
-        permalink = article.find("a", href=re.compile(r"/status/\d+"))
-        if not permalink:
+        # Extract tweet ID from permalink
+        permalink = article.locator('a[href*="/status/"]')
+        if await permalink.count() == 0:
             return None
 
-        href = permalink.get("href", "")
+        href = await permalink.first.get_attribute("href") or ""
         tweet_id_match = re.search(r"/status/(\d+)", href)
         if not tweet_id_match:
             return None
@@ -282,40 +281,36 @@ class XScraper:
         tweet_id = tweet_id_match.group(1)
 
         # Extract timestamp
-        time_element = article.find("time")
-        if time_element and time_element.get("datetime"):
-            created_at = datetime.fromisoformat(time_element["datetime"].replace("Z", "+00:00"))
-        else:
-            created_at = datetime.now()
+        time_element = article.locator("time")
+        created_at = datetime.now()
+        if await time_element.count() > 0:
+            datetime_str = await time_element.first.get_attribute("datetime")
+            if datetime_str:
+                created_at = datetime.fromisoformat(datetime_str.replace("Z", "+00:00"))
 
         # Extract media
         media_list = []
-        images = article.find_all("img", {"src": re.compile(r"pbs\.twimg\.com/media")})
-        for img in images:
-            media_list.append(
-                Media(
-                    type="image",
-                    url=img.get("src", ""),
-                )
-            )
+        images = article.locator('img[src*="pbs.twimg.com/media"]')
+        img_count = await images.count()
+        for j in range(img_count):
+            src = await images.nth(j).get_attribute("src")
+            if src:
+                media_list.append(Media(type="image", url=src))
 
         # Check for video
-        video_container = article.find("div", {"data-testid": "videoComponent"})
-        if video_container:
-            video = video_container.find("video")
-            if video:
-                poster = video.get("poster", "")
-                media_list.append(
-                    Media(
-                        type="video",
-                        url=poster,  # Video URL requires additional API call
-                        thumbnail_url=poster,
-                    )
-                )
+        video_container = article.locator('[data-testid="videoComponent"]')
+        if await video_container.count() > 0:
+            video = video_container.locator("video")
+            if await video.count() > 0:
+                poster = await video.first.get_attribute("poster")
+                if poster:
+                    media_list.append(Media(type="video", url=poster, thumbnail_url=poster))
 
         # Extract avatar
-        avatar_img = article.find("img", {"src": re.compile(r"pbs\.twimg\.com/profile_images")})
-        avatar_url = avatar_img.get("src") if avatar_img else None
+        avatar_img = article.locator('img[src*="pbs.twimg.com/profile_images"]')
+        avatar_url = None
+        if await avatar_img.count() > 0:
+            avatar_url = await avatar_img.first.get_attribute("src")
 
         author = Author(
             id=username,
@@ -326,7 +321,7 @@ class XScraper:
         )
 
         # Extract metrics
-        metrics = self._extract_metrics(article)
+        metrics = await self._extract_metrics(article)
 
         return SavedPost(
             id=tweet_id,
@@ -339,7 +334,7 @@ class XScraper:
             metadata=metrics,
         )
 
-    def _extract_metrics(self, article) -> dict:
+    async def _extract_metrics(self, article: Locator) -> dict:
         """Extract engagement metrics from the article."""
         metrics = XMetadata(
             retweet_count=0,
@@ -348,7 +343,6 @@ class XScraper:
             quote_count=0,
         )
 
-        # Look for metric groups by data-testid
         metric_mappings = [
             ("reply", "reply_count"),
             ("retweet", "retweet_count"),
@@ -356,10 +350,9 @@ class XScraper:
         ]
 
         for testid, attr in metric_mappings:
-            group = article.find("button", {"data-testid": testid})
-            if group:
-                # Find the text showing the count
-                aria_label = group.get("aria-label", "")
+            button = article.locator(f'button[data-testid="{testid}"]')
+            if await button.count() > 0:
+                aria_label = await button.first.get_attribute("aria-label") or ""
                 count_match = re.search(r"(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)", aria_label)
                 if count_match:
                     setattr(metrics, attr, self._parse_count(count_match.group(1)))
@@ -385,29 +378,6 @@ class XScraper:
             return int(text.replace(",", ""))
         except ValueError:
             return 0
-
-    async def get_bookmarks(
-        self,
-        limit: Optional[int] = None,
-        scroll_count: int = 5,
-    ) -> list[SavedPost]:
-        """
-        Fetch and parse bookmarked tweets.
-
-        Args:
-            limit: Maximum number of bookmarks to return
-            scroll_count: Number of times to scroll for more content
-
-        Returns:
-            List of SavedPost objects
-        """
-        html = await self.fetch_bookmarks_page(scroll_count=scroll_count)
-        posts = self.parse_articles(html)
-
-        if limit:
-            posts = posts[:limit]
-
-        return posts
 
     def search_bookmarks(
         self,

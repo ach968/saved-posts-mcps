@@ -21,7 +21,7 @@ def get_scraper() -> XScraper:
 
 
 @mcp.tool()
-async def get_x_bookmarks(limit: int = 100, refresh: bool = False) -> str:
+async def get_x_bookmarks(limit: int = 250, refresh: bool = False) -> str:
     """
     Fetch the user's bookmarked tweets from X (Twitter) via web scraping.
 
@@ -45,7 +45,7 @@ async def get_x_bookmarks(limit: int = 100, refresh: bool = False) -> str:
 
 
 @mcp.tool()
-async def search_x_bookmarks(query: str, limit: int = 50) -> str:
+async def search_x_bookmarks(query: str, limit: int = 250) -> str:
     """
     Search through bookmarked tweets by keyword.
 

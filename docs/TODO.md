@@ -1,0 +1,2 @@
+- [ ] X - get_bookmarks seems to be retrieving posts from oldest to newest. need this logic flipped
+- [ ] X - need to clean up scraper output
