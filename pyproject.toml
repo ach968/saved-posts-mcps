@@ -1,0 +1,27 @@
+[project]
+name = "saved-posts-aggregator"
+version = "0.1.0"
+description = "MCP server IaC repo for aggregating saved posts from X, Reddit, and other platforms"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "httpx>=0.27.0",
+    "praw>=7.7.0",
+    "authlib>=1.3.0",
+    "pydantic>=2.0.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "playwright>=1.40.0",
+]
+
+[project.scripts]
+x-server = "src.x.server:main"
+reddit-server = "src.reddit.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
