@@ -1,2 +1,3 @@
-- [ ] X - get_bookmarks seems to be retrieving posts from oldest to newest. need this logic flipped
-- [ ] X - need to clean up scraper output
+- [ ] X - need to implement faster and better infinite scroll logic
+- [x] X - get_bookmarks seems to be retrieving posts from oldest to newest. need this logic flipped
+- [x] X - need to clean up scraper output

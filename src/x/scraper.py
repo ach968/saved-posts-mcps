@@ -136,19 +136,19 @@ class XScraper:
     async def get_bookmarks(
         self,
         limit: Optional[int] = None,
-        scroll_count: int = 15,
+        max_scrolls: int = 100,
     ) -> list[SavedPost]:
         """
         Fetch and parse bookmarked tweets using Playwright.
 
         Args:
             limit: Maximum number of bookmarks to return
-            scroll_count: Number of times to scroll for more content
+            max_scrolls: Safety limit for maximum scroll attempts (default 100)
 
         Returns:
             List of SavedPost objects
         """
-        logger.info(f"Starting get_bookmarks with {scroll_count} scrolls")
+        logger.info(f"Starting get_bookmarks (max {max_scrolls} scrolls)")
         logger.info(f"Loaded {len(self.cookies)} cookies")
 
         context = await self._get_context()
@@ -181,15 +181,35 @@ class XScraper:
                 logger.warning(f"No articles found: {e}")
                 return []
 
-            # Scroll to load more tweets
-            for i in range(scroll_count):
-                logger.info(f"Scroll {i+1}/{scroll_count}")
+            # Scroll until no new content loads
+            prev_count = 0
+            no_new_content_count = 0
+            scroll_num = 0
+
+            while scroll_num < max_scrolls:
+                scroll_num += 1
+                current_count = await page.locator("article").count()
+
+                if current_count == prev_count:
+                    no_new_content_count += 1
+                    if no_new_content_count >= 3:
+                        logger.info(f"No new content after {scroll_num} scrolls, stopping")
+                        break
+                else:
+                    no_new_content_count = 0
+                    logger.info(f"Scroll {scroll_num}: {current_count} articles")
+
+                prev_count = current_count
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(1.5)
 
             # Parse articles using Playwright locators
             posts = await self._parse_articles(page)
             logger.info(f"Parsed {len(posts)} posts")
+
+            # Reverse to get newest-saved first
+            # X.com's infinite scroll prepends older content to DOM, so DOM order is reversed
+            posts.reverse()
 
             if limit:
                 posts = posts[:limit]
@@ -235,6 +255,7 @@ class XScraper:
         content = ""
         if await tweet_text.count() > 0:
             content = await tweet_text.first.inner_text()
+            content = self._normalize_text(content)
 
         # Extract author info from User-Name div
         user_name_element = article.locator('[data-testid="User-Name"]')
@@ -378,6 +399,13 @@ class XScraper:
             return int(text.replace(",", ""))
         except ValueError:
             return 0
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text by collapsing whitespace and trimming."""
+        # Replace multiple whitespace (including newlines) with single space
+        text = re.sub(r'\s+', ' ', text)
+        # Trim leading/trailing whitespace
+        return text.strip()
 
     def search_bookmarks(
         self,
