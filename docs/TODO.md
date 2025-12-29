@@ -1,3 +1,4 @@
-- [ ] X - need to implement faster and better infinite scroll logic
+- [x] X - faster data retrieval?
+- [x] X - need to implement faster and better infinite scroll logic. why are posts still not retrieved in order?
 - [x] X - get_bookmarks seems to be retrieving posts from oldest to newest. need this logic flipped
 - [x] X - need to clean up scraper output

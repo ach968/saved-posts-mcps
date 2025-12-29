@@ -8,11 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Response,
+)
 
 from src.common.models import Author, Media, SavedPost, XMetadata
 
-# Configure logging to stderr (stdout is used for MCP JSON-RPC)
 logging.basicConfig(
     level=logging.INFO,
     format="[XScraper] %(message)s",
@@ -96,14 +100,16 @@ class XScraper:
                 if domain in [".x.com", "x.com", ".twitter.com", "twitter.com"]:
                     # Convert to x.com domain
                     cookie_domain = ".x.com" if domain.startswith(".") else "x.com"
-                    self.cookies.append({
-                        "name": parts[5],
-                        "value": parts[6],
-                        "domain": cookie_domain,
-                        "path": parts[2],
-                        "secure": parts[3].upper() == "TRUE",
-                        "httpOnly": False,
-                    })
+                    self.cookies.append(
+                        {
+                            "name": parts[5],
+                            "value": parts[6],
+                            "domain": cookie_domain,
+                            "path": parts[2],
+                            "secure": parts[3].upper() == "TRUE",
+                            "httpOnly": False,
+                        }
+                    )
 
     async def _get_browser(self) -> Browser:
         """Get or create browser instance."""
@@ -139,7 +145,7 @@ class XScraper:
         max_scrolls: int = 100,
     ) -> list[SavedPost]:
         """
-        Fetch and parse bookmarked tweets using Playwright.
+        Fetch bookmarked tweets by intercepting X's GraphQL API responses.
 
         Args:
             limit: Maximum number of bookmarks to return
@@ -157,255 +163,196 @@ class XScraper:
         page = await context.new_page()
         logger.info("Created new page")
 
+        # Collect tweets from GraphQL responses
+        collected_posts: list[SavedPost] = []
+        seen_ids: set[str] = set()
+
+        def handle_response(response: Response) -> None:
+            """Capture GraphQL bookmark responses."""
+            if "Bookmarks" in response.url and "graphql" in response.url:
+                try:
+                    # Run async json() in the event loop
+                    asyncio.create_task(self._process_response(response, collected_posts, seen_ids))
+                except Exception as e:
+                    logger.warning(f"Error queuing response: {e}")
+
+        page.on("response", handle_response)
+
         try:
-            # Navigate to bookmarks
+            # Block unnecessary resources for speed
+            await page.route(
+                re.compile(r"\.(png|jpg|jpeg|gif|webp|css|woff|woff2)$"),
+                lambda route: route.abort()
+            )
+
             logger.info(f"Navigating to {BOOKMARKS_URL}")
             await page.goto(BOOKMARKS_URL, wait_until="domcontentloaded", timeout=60000)
             logger.info(f"Page loaded, current URL: {page.url}")
 
-            # Take a screenshot for debugging
-            await page.screenshot(path="/tmp/x_bookmarks_debug.png")
-            logger.info("Screenshot saved to /tmp/x_bookmarks_debug.png")
-
-            # Check if we got redirected to login
             if "login" in page.url.lower():
                 logger.error("Redirected to login page - cookies may be invalid")
                 return []
 
-            # Wait for tweets to load
-            logger.info("Waiting for article elements...")
-            try:
-                await page.wait_for_selector("article", timeout=15000)
-                logger.info("Found article elements")
-            except Exception as e:
-                logger.warning(f"No articles found: {e}")
-                return []
+            # Wait for initial content
+            await asyncio.sleep(2)
 
-            # Scroll until no new content loads
-            prev_count = 0
-            no_new_content_count = 0
+            target = limit if limit else 25
             scroll_num = 0
+            no_new_count = 0
+            last_count = 0
 
-            while scroll_num < max_scrolls:
+            while scroll_num < max_scrolls and len(collected_posts) < target:
                 scroll_num += 1
-                current_count = await page.locator("article").count()
 
-                if current_count == prev_count:
-                    no_new_content_count += 1
-                    if no_new_content_count >= 3:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1)
+
+                # Check if we got new posts
+                if len(collected_posts) > last_count:
+                    logger.info(f"Scroll {scroll_num}: {len(collected_posts)} posts collected")
+                    last_count = len(collected_posts)
+                    no_new_count = 0
+                else:
+                    no_new_count += 1
+                    if no_new_count >= 3:
                         logger.info(f"No new content after {scroll_num} scrolls, stopping")
                         break
-                else:
-                    no_new_content_count = 0
-                    logger.info(f"Scroll {scroll_num}: {current_count} articles")
 
-                prev_count = current_count
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(1.5)
-
-            # Parse articles using Playwright locators
-            posts = await self._parse_articles(page)
-            logger.info(f"Parsed {len(posts)} posts")
-
-            # Reverse to get newest-saved first
-            # X.com's infinite scroll prepends older content to DOM, so DOM order is reversed
-            posts.reverse()
+            logger.info(f"Collected {len(collected_posts)} posts via GraphQL")
 
             if limit:
-                posts = posts[:limit]
+                collected_posts = collected_posts[:limit]
 
-            return posts
+            return collected_posts
 
         except Exception as e:
             logger.error(f"Error during fetch: {e}")
-            try:
-                await page.screenshot(path="/tmp/x_bookmarks_error.png")
-                logger.info("Error screenshot saved to /tmp/x_bookmarks_error.png")
-            except:
-                pass
             raise
 
         finally:
             await page.close()
             logger.info("Page closed")
 
-    async def _parse_articles(self, page: Page) -> list[SavedPost]:
-        """Parse all article elements from the page using Playwright."""
-        articles = page.locator("article")
-        count = await articles.count()
-        logger.info(f"Found {count} articles to parse")
-
-        posts = []
-        for i in range(count):
-            try:
-                article = articles.nth(i)
-                post = await self._parse_article(article)
-                if post:
+    async def _process_response(
+        self, response: Response, posts: list[SavedPost], seen_ids: set[str]
+    ) -> None:
+        """Process a GraphQL response and add new posts."""
+        try:
+            data = await response.json()
+            new_posts = self._parse_graphql_response(data)
+            for post in new_posts:
+                if post.id not in seen_ids:
+                    seen_ids.add(post.id)
                     posts.append(post)
-            except Exception as e:
-                logger.warning(f"Error parsing article {i}: {e}")
-                continue
+        except Exception as e:
+            logger.warning(f"Error processing response: {e}")
 
-        return posts
-
-    async def _parse_article(self, article: Locator) -> Optional[SavedPost]:
-        """Parse a single article element into a SavedPost."""
-        # Extract tweet text
-        tweet_text = article.locator('[data-testid="tweetText"]')
-        content = ""
-        if await tweet_text.count() > 0:
-            content = await tweet_text.first.inner_text()
-            content = self._normalize_text(content)
-
-        # Extract author info from User-Name div
-        user_name_element = article.locator('[data-testid="User-Name"]')
-        if await user_name_element.count() == 0:
-            return None
-
-        # Find username from links
-        links = user_name_element.locator("a")
-        username = None
-        display_name = None
-
-        link_count = await links.count()
-        for j in range(link_count):
-            link = links.nth(j)
-            href = await link.get_attribute("href") or ""
-            if href and re.match(r"^/[^/]+$", href) and not href.startswith("/i/"):
-                username = href.strip("/")
-                # Try to get display name from spans
-                spans = link.locator("span")
-                span_count = await spans.count()
-                for k in range(span_count):
-                    text = await spans.nth(k).inner_text()
-                    if text and not text.startswith("@"):
-                        display_name = text.strip()
-                        break
-                break
-
-        if not username:
-            return None
-
-        if not display_name:
-            display_name = username
-
-        # Extract tweet ID from permalink
-        permalink = article.locator('a[href*="/status/"]')
-        if await permalink.count() == 0:
-            return None
-
-        href = await permalink.first.get_attribute("href") or ""
-        tweet_id_match = re.search(r"/status/(\d+)", href)
-        if not tweet_id_match:
-            return None
-
-        tweet_id = tweet_id_match.group(1)
-
-        # Extract timestamp
-        time_element = article.locator("time")
-        created_at = datetime.now()
-        if await time_element.count() > 0:
-            datetime_str = await time_element.first.get_attribute("datetime")
-            if datetime_str:
-                created_at = datetime.fromisoformat(datetime_str.replace("Z", "+00:00"))
-
-        # Extract media
-        media_list = []
-        images = article.locator('img[src*="pbs.twimg.com/media"]')
-        img_count = await images.count()
-        for j in range(img_count):
-            src = await images.nth(j).get_attribute("src")
-            if src:
-                media_list.append(Media(type="image", url=src))
-
-        # Check for video
-        video_container = article.locator('[data-testid="videoComponent"]')
-        if await video_container.count() > 0:
-            video = video_container.locator("video")
-            if await video.count() > 0:
-                poster = await video.first.get_attribute("poster")
-                if poster:
-                    media_list.append(Media(type="video", url=poster, thumbnail_url=poster))
-
-        # Extract avatar
-        avatar_img = article.locator('img[src*="pbs.twimg.com/profile_images"]')
-        avatar_url = None
-        if await avatar_img.count() > 0:
-            avatar_url = await avatar_img.first.get_attribute("src")
-
-        author = Author(
-            id=username,
-            username=username,
-            display_name=display_name,
-            avatar_url=avatar_url,
-            platform="x",
-        )
-
-        # Extract metrics
-        metrics = await self._extract_metrics(article)
-
-        return SavedPost(
-            id=tweet_id,
-            platform="x",
-            author=author,
-            content=content,
-            url=f"https://x.com/{username}/status/{tweet_id}",
-            created_at=created_at,
-            media=media_list,
-            metadata=metrics,
-        )
-
-    async def _extract_metrics(self, article: Locator) -> dict:
-        """Extract engagement metrics from the article."""
-        metrics = XMetadata(
-            retweet_count=0,
-            like_count=0,
-            reply_count=0,
-            quote_count=0,
-        )
-
-        metric_mappings = [
-            ("reply", "reply_count"),
-            ("retweet", "retweet_count"),
-            ("like", "like_count"),
-        ]
-
-        for testid, attr in metric_mappings:
-            button = article.locator(f'button[data-testid="{testid}"]')
-            if await button.count() > 0:
-                aria_label = await button.first.get_attribute("aria-label") or ""
-                count_match = re.search(r"(\d+(?:,\d+)*(?:\.\d+)?[KMB]?)", aria_label)
-                if count_match:
-                    setattr(metrics, attr, self._parse_count(count_match.group(1)))
-
-        return metrics.model_dump()
-
-    def _parse_count(self, text: str) -> int:
-        """Parse a count string like '1.2K' or '500' into an integer."""
-        text = text.strip()
-        if not text:
-            return 0
-
-        multipliers = {"K": 1000, "M": 1000000, "B": 1000000000}
-
-        for suffix, mult in multipliers.items():
-            if text.endswith(suffix):
-                try:
-                    return int(float(text[:-1]) * mult)
-                except ValueError:
-                    return 0
+    def _parse_graphql_response(self, data: dict) -> list[SavedPost]:
+        """Extract tweets from X's GraphQL bookmark response."""
+        posts = []
 
         try:
-            return int(text.replace(",", ""))
-        except ValueError:
-            return 0
+            # Navigate the GraphQL response structure
+            timeline = data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
+            instructions = timeline.get("instructions", [])
 
-    def _normalize_text(self, text: str) -> str:
-        """Normalize text by collapsing whitespace and trimming."""
-        # Replace multiple whitespace (including newlines) with single space
-        text = re.sub(r'\s+', ' ', text)
-        # Trim leading/trailing whitespace
-        return text.strip()
+            for instruction in instructions:
+                entries = instruction.get("entries", [])
+                for entry in entries:
+                    try:
+                        content = entry.get("content", {})
+                        item_content = content.get("itemContent", {})
+                        tweet_results = item_content.get("tweet_results", {})
+                        result = tweet_results.get("result", {})
+
+                        if not result:
+                            continue
+
+                        # Handle tweets wrapped in "tweet" field (for retweets/quoted)
+                        if "tweet" in result:
+                            result = result["tweet"]
+
+                        legacy = result.get("legacy", {})
+                        core = result.get("core", {})
+                        user_results = core.get("user_results", {}).get("result", {})
+                        # User info is now in user_results.core, not user_results.legacy
+                        user_core = user_results.get("core", {})
+                        user_avatar = user_results.get("avatar", {})
+
+                        tweet_id = result.get("rest_id")
+                        if not tweet_id:
+                            continue
+
+                        # Extract author info from user_results.core
+                        username = user_core.get("screen_name", "")
+                        display_name = user_core.get("name", username)
+                        avatar_url = user_avatar.get("image_url")
+
+                        author = Author(
+                            id=user_results.get("rest_id", username),
+                            username=username,
+                            display_name=display_name,
+                            avatar_url=avatar_url,
+                            platform="x",
+                        )
+
+                        # Extract content
+                        full_text = legacy.get("full_text", "")
+
+                        # Extract timestamp
+                        created_at_str = legacy.get("created_at", "")
+                        try:
+                            created_at = datetime.strptime(
+                                created_at_str, "%a %b %d %H:%M:%S %z %Y"
+                            )
+                        except ValueError:
+                            created_at = datetime.now()
+
+                        # Extract media
+                        media_list = []
+                        entities = legacy.get("extended_entities", legacy.get("entities", {}))
+                        for media_item in entities.get("media", []):
+                            media_type = media_item.get("type", "photo")
+                            if media_type == "photo":
+                                media_list.append(Media(
+                                    type="image",
+                                    url=media_item.get("media_url_https", ""),
+                                ))
+                            elif media_type in ("video", "animated_gif"):
+                                media_list.append(Media(
+                                    type="video",
+                                    url=media_item.get("media_url_https", ""),
+                                    thumbnail_url=media_item.get("media_url_https"),
+                                ))
+
+                        # Extract metrics
+                        metrics = XMetadata(
+                            retweet_count=legacy.get("retweet_count", 0),
+                            like_count=legacy.get("favorite_count", 0),
+                            reply_count=legacy.get("reply_count", 0),
+                            quote_count=legacy.get("quote_count", 0),
+                        )
+
+                        post = SavedPost(
+                            id=tweet_id,
+                            platform="x",
+                            author=author,
+                            content=full_text,
+                            url=f"https://x.com/{username}/status/{tweet_id}",
+                            created_at=created_at,
+                            media=media_list,
+                            metadata=metrics.model_dump(),
+                        )
+                        posts.append(post)
+
+                    except Exception as e:
+                        logger.warning(f"Error parsing tweet entry: {e}")
+                        continue
+
+        except Exception as e:
+            logger.warning(f"Error parsing GraphQL response: {e}")
+
+        return posts
 
     def search_bookmarks(
         self,
