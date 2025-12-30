@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -12,7 +11,6 @@ from playwright.async_api import (
     async_playwright,
     Browser,
     BrowserContext,
-    Response,
 )
 
 from src.common.models import Author, Media, SavedPost, XMetadata
@@ -25,6 +23,45 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOOKMARKS_URL = "https://x.com/i/bookmarks"
+GRAPHQL_ENDPOINT = "https://x.com/i/api/graphql/E6jlrZG4703s0mcA9DfNKQ/Bookmarks"
+
+# Feature flags required by X's GraphQL API
+GRAPHQL_FEATURES = {
+    "rweb_video_screen_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": False,
+    "rweb_tipjar_consumption_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "responsive_web_grok_show_grok_translated_post": True,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
+    "responsive_web_enhance_cards_enabled": False,
+}
 
 
 class XScraper:
@@ -130,6 +167,52 @@ class XScraper:
             await self._context.add_cookies(self.cookies)
         return self._context
 
+    async def _fetch_bookmarks_with_headers(
+        self,
+        context: BrowserContext,
+        headers: dict,
+        cursor: Optional[str] = None,
+        count: int = 100,
+    ) -> dict:
+        """Fetch a single page of bookmarks using captured headers."""
+        from urllib.parse import urlencode
+
+        variables = {"count": count, "includePromotedContent": True}
+        if cursor:
+            variables["cursor"] = cursor
+
+        params = {
+            "variables": json.dumps(variables),
+            "features": json.dumps(GRAPHQL_FEATURES),
+        }
+        url = f"{GRAPHQL_ENDPOINT}?{urlencode(params)}"
+
+        # Use Playwright's request context with the captured headers
+        response = await context.request.get(url, headers=headers)
+
+        if not response.ok:
+            raise Exception(f"HTTP {response.status}: {response.status_text}")
+
+        return await response.json()
+
+    def _extract_cursor(self, data: dict) -> Optional[str]:
+        """Extract the pagination cursor from a GraphQL response."""
+        try:
+            timeline = (
+                data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
+            )
+            instructions = timeline.get("instructions", [])
+
+            for instruction in instructions:
+                entries = instruction.get("entries", [])
+                for entry in entries:
+                    entry_id = entry.get("entryId", "")
+                    if entry_id.startswith("cursor-bottom-"):
+                        return entry.get("content", {}).get("value")
+        except Exception as e:
+            logger.warning(f"Error extracting cursor: {e}")
+        return None
+
     async def close(self) -> None:
         """Close browser resources."""
         if self._context:
@@ -142,112 +225,125 @@ class XScraper:
     async def get_bookmarks(
         self,
         limit: Optional[int] = None,
-        max_scrolls: int = 250,
+        max_pages: int = 50,
     ) -> list[SavedPost]:
         """
-        Fetch bookmarked tweets by intercepting X's GraphQL API responses.
+        Fetch bookmarked tweets using a hybrid approach:
+        1. Use Playwright to load the page and capture GraphQL request headers
+        2. Use captured headers to make direct API calls
 
         Args:
             limit: Maximum number of bookmarks to return
-            max_scrolls: Safety limit for maximum scroll attempts (default 250)
+            max_pages: Safety limit for maximum API pages to fetch (default 50)
 
         Returns:
             List of SavedPost objects
         """
-        logger.info(f"Starting get_bookmarks (max {max_scrolls} scrolls)")
+        logger.info("Starting get_bookmarks (hybrid approach)")
         logger.info(f"Loaded {len(self.cookies)} cookies")
 
         context = await self._get_context()
-        logger.info("Got browser context")
-
         page = await context.new_page()
-        logger.info("Created new page")
 
-        # Collect tweets from GraphQL responses
-        collected_posts: list[SavedPost] = []
-        seen_ids: set[str] = set()
+        # Will be populated when we capture a GraphQL request
+        captured_headers: dict = {}
 
-        def handle_response(response: Response) -> None:
-            """Capture GraphQL bookmark responses."""
-            if "Bookmarks" in response.url and "graphql" in response.url:
-                try:
-                    # Run async json() in the event loop
-                    asyncio.create_task(self._process_response(response, collected_posts, seen_ids))
-                except Exception as e:
-                    logger.warning(f"Error queuing response: {e}")
+        async def capture_graphql_headers(request):
+            nonlocal captured_headers
+            if (
+                "Bookmarks" in request.url
+                and "graphql" in request.url
+                and not captured_headers
+            ):
+                captured_headers = dict(request.headers)
+                logger.info("Captured GraphQL request headers")
 
-        page.on("response", handle_response)
+        page.on("request", capture_graphql_headers)
 
         try:
             # Block unnecessary resources for speed
             await page.route(
-                re.compile(r"\.(png|jpg|jpeg|gif|webp|css|woff|woff2)$"),
-                lambda route: route.abort()
+                re.compile(r"\.(png|jpg|jpeg|gif|webp|woff|woff2)$"),
+                lambda route: route.abort(),
             )
 
-            logger.info(f"Navigating to {BOOKMARKS_URL}")
+            logger.info(f"Navigating to {BOOKMARKS_URL} to capture headers")
             await page.goto(BOOKMARKS_URL, wait_until="domcontentloaded", timeout=60000)
-            logger.info(f"Page loaded, current URL: {page.url}")
 
             if "login" in page.url.lower():
                 logger.error("Redirected to login page - cookies may be invalid")
                 return []
 
-            # Wait for initial content
-            await asyncio.sleep(3)
-
-            scroll_num = 0
-            no_new_count = 0
-            last_count = 0
-
-            while scroll_num < max_scrolls:
-                if limit and len(collected_posts) >= limit:
-                    logger.info(f"Reached limit of {limit} posts")
+            # Wait for the initial GraphQL request to be captured
+            for _ in range(30):  # Wait up to 3 seconds
+                if captured_headers:
                     break
-                scroll_num += 1
+                await page.wait_for_timeout(100)
 
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(0.5)
+            if not captured_headers:
+                logger.error("Failed to capture GraphQL headers")
+                return []
 
-                # Check if we got new posts
-                if len(collected_posts) > last_count:
-                    logger.info(f"Scroll {scroll_num}: {len(collected_posts)} posts collected")
-                    last_count = len(collected_posts)
-                    no_new_count = 0
-                else:
-                    no_new_count += 1
-                    if no_new_count >= 5:
-                        logger.info(f"No new content after {scroll_num} scrolls, stopping")
+            logger.info("Headers captured, making direct API calls")
+
+            # Now make direct API calls using the captured headers
+            collected_posts: list[SavedPost] = []
+            seen_ids: set[str] = set()
+            cursor: Optional[str] = None
+            page_num = 0
+
+            while page_num < max_pages:
+                page_num += 1
+
+                try:
+                    logger.info(f"Fetching page {page_num}...")
+                    data = await self._fetch_bookmarks_with_headers(
+                        context, captured_headers, cursor
+                    )
+
+                    # Parse posts from response
+                    new_posts = self._parse_graphql_response(data)
+                    added_count = 0
+
+                    for post in new_posts:
+                        if post.id not in seen_ids:
+                            seen_ids.add(post.id)
+                            collected_posts.append(post)
+                            added_count += 1
+                    if added_count == 0:
+                        logger.info("No new posts found on this page, stopping.")
                         break
 
-            logger.info(f"Collected {len(collected_posts)} posts via GraphQL")
+                    logger.info(
+                        f"Page {page_num}: added {added_count} new posts (total: {len(collected_posts)})"
+                    )
+
+                    # Check if we've reached the limit
+                    if limit and len(collected_posts) >= limit:
+                        logger.info(f"Reached limit of {limit} posts")
+                        break
+
+                    # Get next page cursor
+                    next_cursor = self._extract_cursor(data)
+                    if not next_cursor:
+                        logger.info("No more pages available")
+                        break
+
+                    cursor = next_cursor
+
+                except Exception as e:
+                    logger.error(f"Error fetching page {page_num}: {e}")
+                    break
+
+            logger.info(f"Collected {len(collected_posts)} posts total")
 
             if limit:
                 collected_posts = collected_posts[:limit]
 
             return collected_posts
 
-        except Exception as e:
-            logger.error(f"Error during fetch: {e}")
-            raise
-
         finally:
             await page.close()
-            logger.info("Page closed")
-
-    async def _process_response(
-        self, response: Response, posts: list[SavedPost], seen_ids: set[str]
-    ) -> None:
-        """Process a GraphQL response and add new posts."""
-        try:
-            data = await response.json()
-            new_posts = self._parse_graphql_response(data)
-            for post in new_posts:
-                if post.id not in seen_ids:
-                    seen_ids.add(post.id)
-                    posts.append(post)
-        except Exception as e:
-            logger.warning(f"Error processing response: {e}")
 
     def _parse_graphql_response(self, data: dict) -> list[SavedPost]:
         """Extract tweets from X's GraphQL bookmark response."""
@@ -255,7 +351,9 @@ class XScraper:
 
         try:
             # Navigate the GraphQL response structure
-            timeline = data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
+            timeline = (
+                data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
+            )
             instructions = timeline.get("instructions", [])
 
             for instruction in instructions:
@@ -312,20 +410,26 @@ class XScraper:
 
                         # Extract media
                         media_list = []
-                        entities = legacy.get("extended_entities", legacy.get("entities", {}))
+                        entities = legacy.get(
+                            "extended_entities", legacy.get("entities", {})
+                        )
                         for media_item in entities.get("media", []):
                             media_type = media_item.get("type", "photo")
                             if media_type == "photo":
-                                media_list.append(Media(
-                                    type="image",
-                                    url=media_item.get("media_url_https", ""),
-                                ))
+                                media_list.append(
+                                    Media(
+                                        type="image",
+                                        url=media_item.get("media_url_https", ""),
+                                    )
+                                )
                             elif media_type in ("video", "animated_gif"):
-                                media_list.append(Media(
-                                    type="video",
-                                    url=media_item.get("media_url_https", ""),
-                                    thumbnail_url=media_item.get("media_url_https"),
-                                ))
+                                media_list.append(
+                                    Media(
+                                        type="video",
+                                        url=media_item.get("media_url_https", ""),
+                                        thumbnail_url=media_item.get("media_url_https"),
+                                    )
+                                )
 
                         # Extract metrics
                         metrics = XMetadata(
