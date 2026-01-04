@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +12,8 @@ from playwright.async_api import (
     BrowserContext,
 )
 
-from src.common.models import Author, Media, SavedPost, XMetadata
+from src.common.models import SavedPost
+from src.x.utils import parse_graphql_response
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 BOOKMARKS_URL = "https://x.com/i/bookmarks"
 GRAPHQL_ENDPOINT = "https://x.com/i/api/graphql/E6jlrZG4703s0mcA9DfNKQ/Bookmarks"
 
-# Feature flags required by X's GraphQL API
+# Feature flags
 GRAPHQL_FEATURES = {
     "rweb_video_screen_enabled": False,
     "profile_label_improvements_pcf_label_in_post_enabled": True,
@@ -91,7 +91,6 @@ class XScraper:
         elif cookies_list:
             self.cookies = cookies_list
         else:
-            # Try to load from environment variable
             cookies_json = os.environ.get("X_COOKIES")
             if cookies_json:
                 self.cookies = json.loads(cookies_json)
@@ -106,13 +105,11 @@ class XScraper:
         """Load cookies from a JSON file or Netscape cookies.txt format."""
         content = cookies_file.read_text()
 
-        # Try JSON format first
         try:
             data = json.loads(content)
             if isinstance(data, list):
                 self.cookies = data
             elif isinstance(data, dict):
-                # Convert dict to list format for Playwright
                 self.cookies = [
                     {"name": k, "value": v, "domain": ".x.com", "path": "/"}
                     for k, v in data.items()
@@ -121,7 +118,6 @@ class XScraper:
         except json.JSONDecodeError:
             pass
 
-        # Try Netscape cookies.txt format
         self._parse_netscape_cookies(content)
 
     def _parse_netscape_cookies(self, content: str) -> None:
@@ -135,7 +131,6 @@ class XScraper:
             if len(parts) >= 7:
                 domain = parts[0]
                 if domain in [".x.com", "x.com", ".twitter.com", "twitter.com"]:
-                    # Convert to x.com domain
                     cookie_domain = ".x.com" if domain.startswith(".") else "x.com"
                     self.cookies.append(
                         {
@@ -163,16 +158,15 @@ class XScraper:
                 user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
                 viewport={"width": 1920, "height": 1080},
             )
-            # Add cookies
             await self._context.add_cookies(self.cookies)
         return self._context
 
-    async def _fetch_bookmarks_with_headers(
+    async def _fetch_graphql_bookmarks_with_headers(
         self,
         context: BrowserContext,
         headers: dict,
         cursor: Optional[str] = None,
-        count: int = 100,
+        count: int = 800, # 800 from X API default limit
     ) -> dict:
         """Fetch a single page of bookmarks using captured headers."""
         from urllib.parse import urlencode
@@ -245,7 +239,6 @@ class XScraper:
         context = await self._get_context()
         page = await context.new_page()
 
-        # Will be populated when we capture a GraphQL request
         captured_headers: dict = {}
 
         async def capture_graphql_headers(request):
@@ -274,8 +267,8 @@ class XScraper:
                 logger.error("Redirected to login page - cookies may be invalid")
                 return []
 
-            # Wait for the initial GraphQL request to be captured
-            for _ in range(30):  # Wait up to 3 seconds
+            # Wait for the initial GraphQL request to be captured, up to 5 seconds
+            for _ in range(50):
                 if captured_headers:
                     break
                 await page.wait_for_timeout(100)
@@ -286,7 +279,6 @@ class XScraper:
 
             logger.info("Headers captured, making direct API calls")
 
-            # Now make direct API calls using the captured headers
             collected_posts: list[SavedPost] = []
             seen_ids: set[str] = set()
             cursor: Optional[str] = None
@@ -297,12 +289,12 @@ class XScraper:
 
                 try:
                     logger.info(f"Fetching page {page_num}...")
-                    data = await self._fetch_bookmarks_with_headers(
+                    data = await self._fetch_graphql_bookmarks_with_headers(
                         context, captured_headers, cursor
                     )
 
                     # Parse posts from response
-                    new_posts = self._parse_graphql_response(data)
+                    new_posts = parse_graphql_response(data)
                     added_count = 0
 
                     for post in new_posts:
@@ -318,12 +310,10 @@ class XScraper:
                         f"Page {page_num}: added {added_count} new posts (total: {len(collected_posts)})"
                     )
 
-                    # Check if we've reached the limit
                     if limit and len(collected_posts) >= limit:
                         logger.info(f"Reached limit of {limit} posts")
                         break
 
-                    # Get next page cursor
                     next_cursor = self._extract_cursor(data)
                     if not next_cursor:
                         logger.info("No more pages available")
@@ -344,121 +334,6 @@ class XScraper:
 
         finally:
             await page.close()
-
-    def _parse_graphql_response(self, data: dict) -> list[SavedPost]:
-        """Extract tweets from X's GraphQL bookmark response."""
-        posts = []
-
-        try:
-            # Navigate the GraphQL response structure
-            timeline = (
-                data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
-            )
-            instructions = timeline.get("instructions", [])
-
-            for instruction in instructions:
-                entries = instruction.get("entries", [])
-                for entry in entries:
-                    try:
-                        content = entry.get("content", {})
-                        item_content = content.get("itemContent", {})
-                        tweet_results = item_content.get("tweet_results", {})
-                        result = tweet_results.get("result", {})
-
-                        if not result:
-                            continue
-
-                        # Handle tweets wrapped in "tweet" field (for retweets/quoted)
-                        if "tweet" in result:
-                            result = result["tweet"]
-
-                        legacy = result.get("legacy", {})
-                        core = result.get("core", {})
-                        user_results = core.get("user_results", {}).get("result", {})
-                        # User info is now in user_results.core, not user_results.legacy
-                        user_core = user_results.get("core", {})
-                        user_avatar = user_results.get("avatar", {})
-
-                        tweet_id = result.get("rest_id")
-                        if not tweet_id:
-                            continue
-
-                        # Extract author info from user_results.core
-                        username = user_core.get("screen_name", "")
-                        display_name = user_core.get("name", username)
-                        avatar_url = user_avatar.get("image_url")
-
-                        author = Author(
-                            id=user_results.get("rest_id", username),
-                            username=username,
-                            display_name=display_name,
-                            avatar_url=avatar_url,
-                            platform="x",
-                        )
-
-                        # Extract content
-                        full_text = legacy.get("full_text", "")
-
-                        # Extract timestamp
-                        created_at_str = legacy.get("created_at", "")
-                        try:
-                            created_at = datetime.strptime(
-                                created_at_str, "%a %b %d %H:%M:%S %z %Y"
-                            )
-                        except ValueError:
-                            created_at = datetime.now()
-
-                        # Extract media
-                        media_list = []
-                        entities = legacy.get(
-                            "extended_entities", legacy.get("entities", {})
-                        )
-                        for media_item in entities.get("media", []):
-                            media_type = media_item.get("type", "photo")
-                            if media_type == "photo":
-                                media_list.append(
-                                    Media(
-                                        type="image",
-                                        url=media_item.get("media_url_https", ""),
-                                    )
-                                )
-                            elif media_type in ("video", "animated_gif"):
-                                media_list.append(
-                                    Media(
-                                        type="video",
-                                        url=media_item.get("media_url_https", ""),
-                                        thumbnail_url=media_item.get("media_url_https"),
-                                    )
-                                )
-
-                        # Extract metrics
-                        metrics = XMetadata(
-                            retweet_count=legacy.get("retweet_count", 0),
-                            like_count=legacy.get("favorite_count", 0),
-                            reply_count=legacy.get("reply_count", 0),
-                            quote_count=legacy.get("quote_count", 0),
-                        )
-
-                        post = SavedPost(
-                            id=tweet_id,
-                            platform="x",
-                            author=author,
-                            content=full_text,
-                            url=f"https://x.com/{username}/status/{tweet_id}",
-                            created_at=created_at,
-                            media=media_list,
-                            metadata=metrics.model_dump(),
-                        )
-                        posts.append(post)
-
-                    except Exception as e:
-                        logger.warning(f"Error parsing tweet entry: {e}")
-                        continue
-
-        except Exception as e:
-            logger.warning(f"Error parsing GraphQL response: {e}")
-
-        return posts
 
     def search_bookmarks(
         self,
@@ -496,7 +371,6 @@ class XScraper:
         if cookies_json:
             return cls(cookies_list=json.loads(cookies_json), headless=headless)
 
-        # Try default location
         default_path = Path.home() / ".x_cookies.txt"
         if default_path.exists():
             return cls(cookies_file=default_path, headless=headless)

@@ -1,8 +1,12 @@
 """Shared utility functions for the X scraper."""
 
+import logging
 import re
+from datetime import datetime
 
-from src.common.models import SavedPost
+from src.common.models import Author, Media, SavedPost, XMetadata
+
+logger = logging.getLogger(__name__)
 
 
 def clean_text(text: str, max_length: int = 280) -> str:
@@ -83,3 +87,112 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r" \n", " ", text)
     return text.strip()
+
+
+def parse_graphql_response(data: dict) -> list[SavedPost]:
+    """Extract tweets from X's GraphQL bookmark response."""
+    posts = []
+
+    try:
+        timeline = (
+            data.get("data", {}).get("bookmark_timeline_v2", {}).get("timeline", {})
+        )
+        instructions = timeline.get("instructions", [])
+
+        for instruction in instructions:
+            entries = instruction.get("entries", [])
+            for entry in entries:
+                try:
+                    content = entry.get("content", {})
+                    item_content = content.get("itemContent", {})
+                    tweet_results = item_content.get("tweet_results", {})
+                    result = tweet_results.get("result", {})
+
+                    if not result:
+                        continue
+
+                    # Handle tweets wrapped in "tweet" field (for retweets/quoted)
+                    if "tweet" in result:
+                        result = result["tweet"]
+
+                    legacy = result.get("legacy", {})
+                    core = result.get("core", {})
+                    user_results = core.get("user_results", {}).get("result", {})
+                    user_core = user_results.get("core", {})
+                    user_avatar = user_results.get("avatar", {})
+
+                    tweet_id = result.get("rest_id")
+                    if not tweet_id:
+                        continue
+
+                    username = user_core.get("screen_name", "")
+                    display_name = user_core.get("name", username)
+                    avatar_url = user_avatar.get("image_url")
+
+                    author = Author(
+                        id=user_results.get("rest_id", username),
+                        username=username,
+                        display_name=display_name,
+                        avatar_url=avatar_url,
+                        platform="x",
+                    )
+
+                    full_text = legacy.get("full_text", "")
+
+                    created_at_str = legacy.get("created_at", "")
+                    try:
+                        created_at = datetime.strptime(
+                            created_at_str, "%a %b %d %H:%M:%S %z %Y"
+                        )
+                    except ValueError:
+                        created_at = datetime.now()
+
+                    media_list = []
+                    entities = legacy.get(
+                        "extended_entities", legacy.get("entities", {})
+                    )
+                    for media_item in entities.get("media", []):
+                        media_type = media_item.get("type", "photo")
+                        if media_type == "photo":
+                            media_list.append(
+                                Media(
+                                    type="image",
+                                    url=media_item.get("media_url_https", ""),
+                                )
+                            )
+                        elif media_type in ("video", "animated_gif"):
+                            media_list.append(
+                                Media(
+                                    type="video",
+                                    url=media_item.get("media_url_https", ""),
+                                    thumbnail_url=media_item.get("media_url_https"),
+                                )
+                            )
+
+                    metrics = XMetadata(
+                        retweet_count=legacy.get("retweet_count", 0),
+                        like_count=legacy.get("favorite_count", 0),
+                        reply_count=legacy.get("reply_count", 0),
+                        quote_count=legacy.get("quote_count", 0),
+                    )
+
+                    post = SavedPost(
+                        id=tweet_id,
+                        platform="x",
+                        author=author,
+                        content=full_text,
+                        url=f"https://x.com/{username}/status/{tweet_id}",
+                        created_at=created_at,
+                        media=media_list,
+                        metadata=metrics.model_dump(),
+                    )
+                    posts.append(post)
+
+                except Exception as e:
+                    logger.warning(f"Error parsing tweet entry: {e}")
+                    continue
+
+    except Exception as e:
+        logger.warning(f"Error parsing GraphQL response: {e}")
+
+    return posts
