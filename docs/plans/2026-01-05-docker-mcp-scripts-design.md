@@ -30,7 +30,7 @@ Builds Docker images for X and/or Reddit MCP servers.
 
 ### `scripts/mcp-config.sh`
 
-Adds MCP server configs to Claude Code pointing to local Docker containers.
+Adds MCP server configs to Claude Code that auto-start Docker containers via stdio.
 
 ```bash
 # Usage
@@ -42,16 +42,20 @@ Adds MCP server configs to Claude Code pointing to local Docker containers.
 ./scripts/mcp-config.sh all     # Add both (default)
 ```
 
-**MCP endpoints**:
-| Server | URL |
-|--------|-----|
-| `saved-posts-x` | `http://localhost:8001/mcp` |
-| `saved-posts-reddit` | `http://localhost:8002/mcp` |
+**How it works**:
+- Claude Code spawns `docker run -i --rm` with stdio transport
+- Container runs in interactive mode, communicates via stdin/stdout
+- Container auto-starts when Claude needs the MCP server, auto-removes on exit
+
+**Required env vars** (set in shell profile):
+- `X_COOKIES_FILE` - path to X cookies file
+- `REDDIT_COOKIES_FILE` - path to Reddit cookies file
+- `REDDIT_USERNAME` - Reddit username
 
 **Behavior**:
-- Uses `claude mcp add --transport http` CLI
+- Uses `claude mcp add-json` with stdio transport
 - Adds to user scope (`~/.claude.json`)
-- Overwrites existing entries with same name
+- Removes existing entries before adding
 
 ## Server Changes
 
