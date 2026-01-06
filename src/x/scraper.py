@@ -1,18 +1,18 @@
+"""X (Twitter) bookmarks scraper using Playwright."""
+
 import json
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
-from playwright.async_api import (
-    async_playwright,
-    Browser,
-    BrowserContext,
-)
+from playwright.async_api import BrowserContext
 
+from src.common.fuzzy_search import fuzzy_search
 from src.common.models import SavedPost
+from src.common.playwright_scraper import PlaywrightScraper
 from src.x.utils import parse_graphql_response
 
 logging.basicConfig(
@@ -64,8 +64,10 @@ GRAPHQL_FEATURES = {
 }
 
 
-class XScraper:
+class XScraper(PlaywrightScraper):
     """Scraper for X.com bookmarks using Playwright."""
+
+    X_COOKIE_DOMAINS = [".x.com", "x.com", ".twitter.com", "twitter.com"]
 
     def __init__(
         self,
@@ -81,96 +83,23 @@ class XScraper:
             cookies_list: List of cookie dicts (alternative to file)
             headless: Run browser in headless mode
         """
-        self.cookies: list[dict] = []
-        self.headless = headless
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-
-        if cookies_file and cookies_file.exists():
-            self._load_cookies_from_file(cookies_file)
-        elif cookies_list:
-            self.cookies = cookies_list
-        else:
-            cookies_json = os.environ.get("X_COOKIES")
-            if cookies_json:
-                self.cookies = json.loads(cookies_json)
-
-        if not self.cookies:
-            raise ValueError(
-                "No cookies provided. Export cookies from your browser as JSON, "
-                "or set X_COOKIES environment variable."
-            )
-
-    def _load_cookies_from_file(self, cookies_file: Path) -> None:
-        """Load cookies from a JSON file or Netscape cookies.txt format."""
-        content = cookies_file.read_text()
-
-        try:
-            data = json.loads(content)
-            if isinstance(data, list):
-                self.cookies = data
-            elif isinstance(data, dict):
-                self.cookies = [
-                    {"name": k, "value": v, "domain": ".x.com", "path": "/"}
-                    for k, v in data.items()
-                ]
-            return
-        except json.JSONDecodeError:
-            pass
-
-        self._parse_netscape_cookies(content)
-
-    def _parse_netscape_cookies(self, content: str) -> None:
-        """Parse Netscape cookies.txt format."""
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                domain = parts[0]
-                if domain in [".x.com", "x.com", ".twitter.com", "twitter.com"]:
-                    cookie_domain = ".x.com" if domain.startswith(".") else "x.com"
-                    self.cookies.append(
-                        {
-                            "name": parts[5],
-                            "value": parts[6],
-                            "domain": cookie_domain,
-                            "path": parts[2],
-                            "secure": parts[3].upper() == "TRUE",
-                            "httpOnly": False,
-                        }
-                    )
-
-    async def _get_browser(self) -> Browser:
-        """Get or create browser instance."""
-        if self._browser is None:
-            playwright = await async_playwright().start()
-            self._browser = await playwright.chromium.launch(headless=self.headless)
-        return self._browser
-
-    async def _get_context(self) -> BrowserContext:
-        """Get or create browser context with cookies."""
-        if self._context is None:
-            browser = await self._get_browser()
-            self._context = await browser.new_context(
-                user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
-                viewport={"width": 1920, "height": 1080},
-            )
-            await self._context.add_cookies(self.cookies)
-        return self._context
+        super().__init__(
+            cookies_file=cookies_file,
+            cookies_list=cookies_list,
+            cookie_domains=self.X_COOKIE_DOMAINS,
+            target_domain=".x.com",
+            headless=headless,
+            env_var_name="X_COOKIES",
+        )
 
     async def _fetch_graphql_bookmarks_with_headers(
         self,
         context: BrowserContext,
         headers: dict,
         cursor: Optional[str] = None,
-        count: int = 800, # 800 from X API default limit
+        count: int = 800,
     ) -> dict:
         """Fetch a single page of bookmarks using captured headers."""
-        from urllib.parse import urlencode
-
         variables = {"count": count, "includePromotedContent": True}
         if cursor:
             variables["cursor"] = cursor
@@ -181,7 +110,6 @@ class XScraper:
         }
         url = f"{GRAPHQL_ENDPOINT}?{urlencode(params)}"
 
-        # Use Playwright's request context with the captured headers
         response = await context.request.get(url, headers=headers)
 
         if not response.ok:
@@ -207,15 +135,6 @@ class XScraper:
             logger.warning(f"Error extracting cursor: {e}")
         return None
 
-    async def close(self) -> None:
-        """Close browser resources."""
-        if self._context:
-            await self._context.close()
-            self._context = None
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-
     async def get_bookmarks(
         self,
         limit: Optional[int] = None,
@@ -234,10 +153,9 @@ class XScraper:
             List of SavedPost objects
         """
         logger.info("Starting get_bookmarks (hybrid approach)")
-        logger.info(f"Loaded {len(self.cookies)} cookies")
 
         context = await self._get_context()
-        page = await context.new_page()
+        page = await self._create_page(block_resources=True)
 
         captured_headers: dict = {}
 
@@ -254,12 +172,6 @@ class XScraper:
         page.on("request", capture_graphql_headers)
 
         try:
-            # Block unnecessary resources for speed
-            await page.route(
-                re.compile(r"\.(png|jpg|jpeg|gif|webp|woff|woff2)$"),
-                lambda route: route.abort(),
-            )
-
             logger.info(f"Navigating to {BOOKMARKS_URL} to capture headers")
             await page.goto(BOOKMARKS_URL, wait_until="domcontentloaded", timeout=60000)
 
@@ -267,7 +179,7 @@ class XScraper:
                 logger.error("Redirected to login page - cookies may be invalid")
                 return []
 
-            # Wait for the initial GraphQL request to be captured, up to 5 seconds
+            # Wait for the initial GraphQL request to be captured
             for _ in range(50):
                 if captured_headers:
                     break
@@ -293,7 +205,6 @@ class XScraper:
                         context, captured_headers, cursor
                     )
 
-                    # Parse posts from response
                     new_posts = parse_graphql_response(data)
                     added_count = 0
 
@@ -338,22 +249,29 @@ class XScraper:
     def search_bookmarks(
         self,
         posts: list[SavedPost],
-        query: str,
+        queries: list[str],
+        match_all: bool = True,
+        fuzzy_threshold: int = 2,
         limit: Optional[int] = None,
     ) -> list[SavedPost]:
         """
-        Search through bookmarks by keyword.
+        Search through bookmarks with fuzzy matching.
 
         Args:
             posts: List of posts to search through
-            query: Search term
+            queries: List of search terms
+            match_all: If True, all queries must match (AND). If False, any match (OR).
+            fuzzy_threshold: Max edit distance for fuzzy matching (0 disables fuzzy)
             limit: Maximum results
 
         Returns:
             Filtered list of matching posts
         """
-        query_lower = query.lower()
-        results = [p for p in posts if query_lower in p.content.lower()]
+        results = [
+            p
+            for p in posts
+            if fuzzy_search(p.content, queries, match_all, fuzzy_threshold)
+        ]
 
         if limit:
             results = results[:limit]

@@ -39,15 +39,20 @@ async def get_x_bookmarks(limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
-async def search_x_bookmarks(query: str) -> list[dict]:
+async def search_x_bookmarks(
+    queries: list[str],
+    match_all: bool = True,
+    fuzzy_threshold: int = 2,
+) -> list[dict]:
     """
-    Search through bookmarked tweets by keyword.
+    Search through bookmarked tweets with fuzzy matching.
 
     Always fetches fresh bookmarks from X.com to ensure complete search results.
 
     Args:
-        query: Search term to look for in tweet text
-        limit: Maximum number of results to return
+        queries: List of search terms to look for in tweet text
+        match_all: If True, all queries must match (AND). If False, any match (OR).
+        fuzzy_threshold: Max edit distance for fuzzy matching (0 disables fuzzy)
 
     Returns:
         List of matching bookmarked tweets
@@ -56,7 +61,12 @@ async def search_x_bookmarks(query: str) -> list[dict]:
 
     bookmarks = await scraper.get_bookmarks()
 
-    results = scraper.search_bookmarks(bookmarks, query=query)
+    results = scraper.search_bookmarks(
+        bookmarks,
+        queries=queries,
+        match_all=match_all,
+        fuzzy_threshold=fuzzy_threshold,
+    )
 
     return [simplify_post(post) for post in results]
 
