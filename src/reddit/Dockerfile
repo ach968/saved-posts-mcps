@@ -23,9 +23,11 @@ RUN uv pip install --system .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV MCP_TRANSPORT=http
+ENV MCP_PORT=8002
 
-# Expose port for HTTP transport (if used)
-EXPOSE 8000
+# Expose port for HTTP transport
+EXPOSE 8002
 
 # Run the MCP server
 CMD ["python", "-m", "src.reddit.server"]

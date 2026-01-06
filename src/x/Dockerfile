@@ -30,9 +30,11 @@ RUN uv pip install --python python3.13 --system .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV MCP_TRANSPORT=http
+ENV MCP_PORT=8001
 
-# Expose port for HTTP transport (if used)
-EXPOSE 8000
+# Expose port for HTTP transport
+EXPOSE 8001
 
 # Run the MCP server using Python 3.13
 CMD ["python3.13", "-m", "src.x.server"]
