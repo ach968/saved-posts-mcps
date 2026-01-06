@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -5,7 +6,21 @@ from mcp.server.fastmcp import FastMCP
 from src.x.scraper import XScraper
 from src.x.utils import simplify_post
 
-mcp = FastMCP("X Bookmarks Server")
+_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
+
+
+def _create_mcp() -> FastMCP:
+    """Create FastMCP instance with HTTP config if MCP_TRANSPORT=http."""
+    if _TRANSPORT == "http":
+        return FastMCP(
+            "X Bookmarks Server",
+            host="0.0.0.0",
+            port=int(os.getenv("MCP_PORT", "8000")),
+        )
+    return FastMCP("X Bookmarks Server")
+
+
+mcp = _create_mcp()
 
 _scraper: Optional[XScraper] = None
 
@@ -73,7 +88,10 @@ async def search_x_bookmarks(
 
 def main():
     """Entry point for the X MCP server."""
-    mcp.run()
+    if _TRANSPORT == "http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
