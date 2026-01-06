@@ -19,7 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SAVED_URL = "https://www.reddit.com/user/{username}/saved"
 SAVED_JSON_URL = "https://www.reddit.com/user/{username}/saved.json"
 
 
@@ -112,7 +111,7 @@ class RedditScraper(PlaywrightScraper):
         page.on("request", capture_headers)
 
         try:
-            saved_url = SAVED_URL.format(username=self.username)
+            saved_url = SAVED_JSON_URL.format(username=self.username)
             logger.info(f"Navigating to {saved_url} to capture headers")
 
             await page.goto(saved_url, wait_until="domcontentloaded", timeout=60000)
