@@ -6,7 +6,21 @@ from mcp.server.fastmcp import FastMCP
 
 from src.reddit.scraper import RedditScraper
 
-mcp = FastMCP("Reddit Saved Posts Server")
+_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
+
+
+def _create_mcp() -> FastMCP:
+    """Create FastMCP instance with HTTP config if MCP_TRANSPORT=http."""
+    if _TRANSPORT == "http":
+        return FastMCP(
+            "Reddit Saved Posts Server",
+            host="0.0.0.0",
+            port=int(os.getenv("MCP_PORT", "8000")),
+        )
+    return FastMCP("Reddit Saved Posts Server")
+
+
+mcp = _create_mcp()
 
 # Global scraper instance (initialized on first use)
 _scraper: Optional[RedditScraper] = None
@@ -194,7 +208,10 @@ def get_user() -> str:
 
 def main():
     """Entry point for the Reddit MCP server."""
-    mcp.run()
+    if _TRANSPORT == "http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
