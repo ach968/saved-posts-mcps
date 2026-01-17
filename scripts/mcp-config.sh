@@ -1,16 +1,6 @@
 #!/bin/bash
 set -e
 
-# MCP config script for Claude Code
-# Usage: ./scripts/mcp-config.sh [x|reddit|all]
-#
-# Prerequisites:
-#   - Docker images built (./scripts/docker-build.sh)
-#   - Environment variables set:
-#     - X_COOKIES_FILE: path to X cookies file
-#     - REDDIT_COOKIES_FILE: path to Reddit cookies file
-#     - REDDIT_USERNAME: Reddit username
-
 add_x() {
     echo "Adding X server MCP config (Docker + stdio)..."
 

@@ -1,2 +1,3 @@
 - [x] ez script to add mcp configs to claude code, and ez dockerfile building scripts (both features bundled together)
 - [ ] design/template docs/guidelines for future scrapers
+- [ ] github starred repos (probably can just use gh cli or github mcp)
